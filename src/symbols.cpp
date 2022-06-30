@@ -89,7 +89,7 @@ int hasRichheader(char const* _filePath)
 #include <DbgHelp.h>
 #pragma warning (default: 4091)
 
-#pragma comment(lib, "dbghelp.lib")
+#pragma comment(lib, "dbghelp.lib") // 静态链接到这个库。写了这句就不用设置工程属性了
 //#pragma comment(lib, "psapi.lib")
 #endif // RTM_COMPILER_MSVC
 

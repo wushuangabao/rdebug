@@ -10,7 +10,10 @@
 #if RTM_PLATFORM_WINDOWS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <tlhelp32.h>
 #endif // RTM_PLATFORM_WINDOWS
+
+#include <rbase/inc/console.h>
 
 namespace rdebug {
 
@@ -73,6 +76,7 @@ bool processInjectDLL(const char* _executablePath, const char* _DLLPath, const c
 	wcscat(cmdLine, L" ");
 	wcscat(cmdLine, rtm::MultiToWide(_cmdLine, false));
 
+	// CREATE_SUSPENDED 表示挂起主线程。本函数最后用 ResumeThread 恢复主线程的运行。
 	if (CreateProcessW(0, cmdLine, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, rtm::MultiToWide(_workingDir), &startInfo, &pInfo) != TRUE)
 		return false;
 
@@ -114,8 +118,103 @@ bool processInjectDLL(const char* _executablePath, const char* _DLLPath, const c
 
 	ResumeThread(pInfo.hThread);
 	if (_pid)
-		*_pid = pInfo.dwProcessId;
+		*_pid = pInfo.dwProcessId; //这是在任务管理器显示的pid
 
+	return true;
+}
+
+bool processInjectDLL(uint32_t * _pid, const char* _DLLPath)
+{
+	DWORD pid = (unsigned long)*_pid;
+	HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, (DWORD)pid);
+	if (hProcess == NULL)
+	{
+		return false;
+	}
+
+	if (!acquireDebugPrivileges(hProcess))
+	{
+		return false;
+	}
+
+	HMODULE kernel32 = GetModuleHandle("kernel32.dll");
+	LPTHREAD_START_ROUTINE loadLib = (LPTHREAD_START_ROUTINE)GetProcAddress(kernel32, "LoadLibraryW");
+
+	char dllPath[2048];
+	rtm::strlCpy(dllPath, RTM_NUM_ELEMENTS(dllPath), _DLLPath);
+	rtm::pathCanonicalize(dllPath);
+
+	rtm::MultiToWide dllPathWide(dllPath);
+	size_t dllPathLen = wcslen(dllPathWide) + 1;
+	LPVOID remoteMem = VirtualAllocEx(hProcess, NULL, dllPathLen * 2, MEM_COMMIT, PAGE_READWRITE);
+	SIZE_T numBytesWritten;
+	if (!WriteProcessMemory(hProcess, remoteMem, dllPathWide, dllPathLen * 2, &numBytesWritten))
+	{
+		TerminateProcess(hProcess, 0);
+		CloseHandle(hProcess);
+		return false;
+	}
+
+	HANDLE remoteThread = CreateRemoteThread(hProcess, NULL, 0, loadLib, remoteMem, 0, NULL);
+
+	if (remoteThread == NULL)
+	{
+		TerminateProcess(hProcess, 0);
+		CloseHandle(hProcess);
+		return false;
+	}
+	else
+	{
+		WaitForSingleObject(remoteThread, INFINITE);
+	}
+
+	return true;
+}
+
+// 卸载DLL
+bool processEjectDLL(uint32_t * _pid)
+{
+	DWORD pid = (unsigned long)*_pid;
+#if RTM_64BIT
+	LPCTSTR szDllName = "MTunerDLL64.dll";
+#else
+	LPCTSTR szDllName = "MTunerDLL32.dll";
+#endif
+	BOOL bMore = FALSE, bFound = FALSE;
+	HANDLE hSnapshot;
+	MODULEENTRY32 me = { sizeof(me) };
+
+	// 使用TH32CS_SNAPMODULE参数获取加载到notepad进程的dll名称
+	hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
+	bMore = Module32First(hSnapshot, &me);
+	for (; bMore; bMore = Module32Next(hSnapshot, &me))
+	{
+		if (!_stricmp((LPCTSTR)me.szModule, szDllName))
+		{
+			bFound = TRUE;
+			break;
+		}
+	}
+	if (!bFound)
+	{
+		CloseHandle(hSnapshot);
+		return false;
+	}
+
+	HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, (DWORD)pid);
+	if (hProcess == NULL)
+		return false;
+	if (!acquireDebugPrivileges(hProcess))
+		return false;
+
+	HMODULE kernel32 = GetModuleHandle("kernel32.dll");
+	LPTHREAD_START_ROUTINE loadLib = (LPTHREAD_START_ROUTINE)GetProcAddress(kernel32, "FreeLibrary");
+	HANDLE remoteThread = CreateRemoteThread(hProcess, NULL, 0, loadLib, me.modBaseAddr, 0, NULL);
+	WaitForSingleObject(remoteThread, INFINITE);
+
+	CloseHandle(remoteThread);
+	CloseHandle(hProcess);
+	CloseHandle(hSnapshot);
 	return true;
 }
 
@@ -137,6 +236,8 @@ bool processRun(const char* _cmdLine, bool _hideWindow, uint32_t* _exitCode)
 
 	if (CreateProcessW(0, cmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &startInfo, &pInfo) != TRUE)
 		return false;
+
+	rtm::Console::info("processRun cmd: %s\n", _cmdLine);
 
 	WaitForSingleObject(pInfo.hProcess, INFINITE);
 	DWORD exitCode = 0;
